@@ -1,0 +1,334 @@
+---
+title: "Random Forest Classification - Lung Cancer Prediction"
+author: "Noelia Caba Martin"
+date: "2026-03-18"
+output: html_document
+---
+
+## Introduction
+
+Lung cancer is one of the leading causes of cancer-related mortality 
+worldwide. Early detection is critical for improving patient outcomes. 
+Machine learning models trained on clinical and symptomatic data can 
+serve as screening tools to identify high-risk patients.
+
+In this analysis, we build a **Random Forest classification model** 
+to predict lung cancer status from 15 clinical and demographic variables 
+collected through patient surveys.
+
+**Research question:** Can we accurately predict lung cancer presence 
+from clinical symptoms and demographic variables?
+
+The main objectives are:
+
+- Perform exploratory data analysis and data cleaning
+- Normalize and scale the data
+- Train a Random Forest classification model
+- Evaluate model performance using standard classification metrics
+- Identify the most important predictors of lung cancer
+
+## Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+```{r libraries}
+library(tidyverse)
+library(ggplot2)
+library(randomForest)
+library(caret)
+library(pROC)
+library(vip)
+library(corrplot)
+```
+
+## Data Loading and Exploration
+```{r load-data}
+# Load dataset
+lung <- read.csv("lung_cancer.csv")
+
+# Convert to dataframe
+lung <- data.frame(lung)
+
+# Initial exploration
+dim(lung)
+str(lung)
+head(lung)
+```
+
+The dataset contains **309 patients** and **16 variables** including 
+demographic information, symptoms, and lifestyle factors. The target 
+variable `LUNG_CANCER` is binary (YES/NO).
+
+Key observations from the initial exploration:
+
+- `GENDER` is coded as character (M/F) and requires conversion
+- Most symptom variables are coded as integers (1 = No, 2 = Yes)
+- `LUNG_CANCER` is coded as character (YES/NO) and requires conversion 
+to factor for classification
+
+## Data Cleaning and Preprocessing
+
+Before training the model, we need to:
+
+1. **Convert categorical variables** to appropriate types
+2. **Check for missing values**
+3. **Check class balance** of the target variable
+4. **Normalize and scale** continuous variables
+5. **Split** into training (80%) and test (20%) sets
+
+```{r preprocessing}
+# Check missing values
+sum(is.na(lung))
+
+# Convert GENDER to numeric (M=1, F=0)
+lung$GENDER <- ifelse(lung$GENDER == "M", 1, 0)
+
+# Convert LUNG_CANCER to factor
+lung <- lung %>%
+  mutate(across(where(is.integer), as.numeric))
+
+# Convert LUNG_CANCER to factor
+lung$LUNG_CANCER <- as.factor(lung$LUNG_CANCER)
+
+# Check class balance
+table(lung$LUNG_CANCER)
+prop.table(table(lung$LUNG_CANCER))
+
+# Normalize and scale AGE
+lung$AGE <- scale(lung$AGE)
+
+lung <- lung %>%
+  mutate(across(where(is.integer), as.numeric))
+
+# Split into training (80%) and test (20%) sets
+set.seed(123)
+train_index <- createDataPartition(lung$LUNG_CANCER,
+                                   p = 0.8,
+                                   list = FALSE)
+train_data <- lung[train_index, ]
+test_data <- lung[-train_index, ]
+
+cat("Training set:", nrow(train_data), "observations\n")
+cat("Test set:", nrow(test_data), "observations\n")
+```
+
+The preprocessing steps confirmed:
+
+- **No missing values** in the dataset ✓
+- **Class distribution:** 87.4% of patients have lung cancer (YES) 
+and 12.6% do not (NO)
+- The dataset shows class imbalance with the majority class being 
+lung cancer positive
+- **AGE** was normalized using z-score standardization (mean = 0, SD = 1)
+- **GENDER** was converted to binary (M = 1, F = 0)
+- The data was split into **248 training** and **61 test** observations
+
+## Exploratory Data Analysis
+
+We perform a brief exploratory analysis to visualize the distribution 
+of key variables and understand the relationship between symptoms and 
+lung cancer status.
+
+```{r eda}
+# Lung cancer distribution
+ggplot(lung, aes(x = LUNG_CANCER, fill = LUNG_CANCER)) +
+  geom_bar(alpha = 0.8, width = 0.5) +
+  geom_text(stat = "count", 
+            aes(label = after_stat(count)), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c("NO" = "#2E9FDF", "YES" = "#E64B35")) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Lung Cancer Distribution",
+       x = "Lung Cancer Status", y = "Count")
+
+# Age distribution by lung cancer status
+ggplot(lung, aes(x = LUNG_CANCER, y = AGE, fill = LUNG_CANCER)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("NO" = "#2E9FDF", "YES" = "#E64B35")) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Age Distribution by Lung Cancer Status",
+       x = "Lung Cancer Status", y = "Age (scaled)")
+
+# Symptom prevalence by lung cancer status
+lung %>%
+  select(LUNG_CANCER, SMOKING, ANXIETY, CHRONIC.DISEASE, 
+         FATIGUE, ALLERGY, WHEEZING, COUGHING) %>%
+  pivot_longer(-LUNG_CANCER, names_to = "symptom", values_to = "value") %>%
+  group_by(LUNG_CANCER, symptom) %>%
+  summarise(prevalence = mean(value == 2)) %>%
+  ggplot(aes(x = symptom, y = prevalence, fill = LUNG_CANCER)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("NO" = "#2E9FDF", "YES" = "#E64B35")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Symptom Prevalence by Lung Cancer Status",
+       x = "Symptom", y = "Prevalence", fill = "Lung Cancer")
+```
+
+The exploratory analysis reveals:
+
+- The dataset is heavily imbalanced with **270 lung cancer cases (87.4%)** 
+vs **39 non-cancer cases (12.6%)**
+- **Age** shows overlapping distributions between groups, suggesting it 
+may not be a strong predictor in this dataset
+- All symptoms show higher prevalence in lung cancer patients, with 
+**fatigue** and **smoking** showing the largest differences between groups
+
+## Model Training
+
+### Handling Class Imbalance
+
+Given the significant class imbalance (87.4% YES vs 12.6% NO), we apply 
+class weights to ensure the model pays adequate attention to the minority 
+class (NO).
+
+```{r train-model}
+# Define class weights
+class_weights <- c("NO" = 10, "YES" = 1)
+
+# Train Random Forest model
+set.seed(123)
+rf_model <- randomForest(
+  LUNG_CANCER ~ .,
+  data = train_data,
+  ntree = 500,
+  mtry = 4,
+  importance = TRUE,
+  classwt = class_weights
+)
+
+# Print model summary
+print(rf_model)
+```
+
+The Random Forest model was trained on 248 observations using 500 trees 
+and 4 variables per split.
+
+The OOB error rate of **10.08%** indicates good overall performance. 
+The confusion matrix shows:
+
+- **94.4% of lung cancer cases** correctly identified
+- **59.4% of non-cancer cases** correctly identified
+
+The lower sensitivity for non-cancer cases reflects the challenge of 
+the class imbalance despite the use of class weights.
+
+## Model Evaluation
+
+We evaluate the model on the **test set** using standard classification 
+metrics and the ROC curve to assess its discriminative ability.
+
+```{r model-evaluation}
+# Make predictions on test set
+predictions <- predict(rf_model, test_data)
+probabilities <- predict(rf_model, test_data, type = "prob")
+
+# Confusion matrix
+conf_matrix <- confusionMatrix(predictions, test_data$LUNG_CANCER,
+                                positive = "YES")
+print(conf_matrix)
+
+# ROC curve
+roc_obj <- roc(test_data$LUNG_CANCER, probabilities[, "YES"])
+
+# Plot ROC curve
+plot(roc_obj,
+     main = paste("ROC Curve - AUC:", round(auc(roc_obj), 3)),
+     col = "#E64B35",
+     lwd = 2,
+     print.auc = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "grey")
+```
+
+The model evaluation on the test set shows excellent performance:
+
+- **AUC-ROC = 0.966:** outstanding discriminative ability, indicating 
+the model can almost perfectly distinguish between lung cancer and 
+non-cancer cases
+- **Sensitivity = 98.1%:** the model correctly identifies 98.1% of 
+lung cancer cases — critical for a screening tool where missing a 
+positive case has serious consequences
+- **Specificity = 14.3%:** the model struggles to identify non-cancer 
+cases, reflecting the challenge of the class imbalance
+- **Accuracy = 88.5%:** high overall accuracy, though largely driven 
+by the majority class
+
+The high sensitivity makes this model potentially valuable as a 
+**preliminary screening tool**, where the priority is to identify 
+all possible cancer cases rather than minimize false positives.
+
+## Variable Importance
+
+As in the previous Random Forest model, we examine which variables 
+contribute most to predicting lung cancer status.
+
+```{r variable-importance}
+vip(rf_model,
+    num_features = 15,
+    aesthetics = list(fill = "#E64B35", color = "#E64B35", alpha = 0.8)) +
+  theme_minimal() +
+  labs(title = "Variable Importance - Lung Cancer Random Forest",
+       subtitle = "Top 15 predictors of lung cancer",
+       x = "Importance", y = "Variable")
+```
+
+The variable importance plot reveals interesting findings:
+
+- **Alcohol consuming** is the strongest predictor, consistent with 
+known associations between alcohol use and lung cancer risk
+- **Peer pressure** ranks second, likely reflecting social influences 
+on lifestyle risk factors such as smoking
+- **Yellow fingers** ranks third, directly associated with heavy smoking
+- **Age and Gender** show the lowest importance, suggesting that in 
+this dataset symptoms and behavioral factors are stronger predictors 
+than demographic variables
+
+This contrasts with the diabetes model, where Age was the strongest 
+predictor, highlighting how different diseases have different 
+risk factor profiles.
+
+## Conclusions
+
+This analysis demonstrates the application of Random Forest machine 
+learning to predict lung cancer status from clinical symptoms and 
+lifestyle factors in a survey-based dataset.
+
+**Key findings:**
+
+1. The Random Forest model achieved an outstanding **AUC-ROC of 0.966**, 
+indicating near-perfect discriminative ability between lung cancer 
+and non-cancer cases.
+
+2. The model showed very high **sensitivity of 98.1%**, correctly 
+identifying almost all lung cancer cases — a critical property 
+for a screening tool where missing a positive case has serious 
+clinical consequences.
+
+3. **Alcohol consuming, peer pressure and yellow fingers** were the 
+strongest predictors of lung cancer, highlighting the importance 
+of behavioral and lifestyle factors over demographic variables.
+
+4. **Age and Gender** showed the lowest importance, contrasting with 
+the diabetes model where age was the dominant predictor — demonstrating 
+that different diseases have fundamentally different risk factor profiles.
+
+5. Class imbalance (87.4% YES vs 12.6% NO) was addressed using class 
+weights, though specificity remained low (14.3%).
+
+**Limitations:**
+
+- The dataset is small (309 patients) which limits the generalizability 
+of the model
+- Survey-based data may be subject to self-reporting bias
+- The very high AUC may indicate overfitting due to the small dataset size
+- External validation on an independent clinical dataset is needed
+
+**Future directions:**
+
+- Apply SMOTE to address class imbalance more effectively
+- Validate the model on a larger, independent clinical dataset
+- Compare performance with other algorithms such as XGBoost or 
+Logistic Regression
+- Incorporate additional clinical variables such as imaging data
